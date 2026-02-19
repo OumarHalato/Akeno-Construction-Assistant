@@ -1,0 +1,7 @@
+{
+  "name": "Akeno Construction Assistant",
+  "description": "A professional AI voice assistant for Akeno Construction, providing real-time product information, pricing, and sales support in Amharic.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
