@@ -11,8 +11,9 @@ const App: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [transcriptions, setTranscriptions] = useState<TranscriptionItem[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const [showSetup, setShowSetup] = useState(false);
   
-  // Image Generation States
   const [productImages, setProductImages] = useState<Record<string, string>>({});
   const [generatingImages, setGeneratingImages] = useState<Record<string, boolean>>({});
 
@@ -33,6 +34,12 @@ const App: React.FC = () => {
   useEffect(() => {
     scrollToBottom();
   }, [transcriptions]);
+
+  const copyToClipboard = (text: string, label: string) => {
+    navigator.clipboard.writeText(text);
+    setCopyStatus(label);
+    setTimeout(() => setCopyStatus(null), 2000);
+  };
 
   const disconnect = useCallback(() => {
     if (sessionRef.current) {
@@ -59,7 +66,6 @@ const App: React.FC = () => {
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
 
@@ -80,27 +86,15 @@ const App: React.FC = () => {
           onopen: () => {
             setIsConnected(true);
             setIsConnecting(false);
-            
             const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
-            
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              const l = inputData.length;
-              const int16 = new Int16Array(l);
-              for (let i = 0; i < l; i++) {
-                int16[i] = inputData[i] * 32768;
-              }
-              const pcmBlob: Blob = {
-                data: encode(new Uint8Array(int16.buffer)),
-                mimeType: 'audio/pcm;rate=16000',
-              };
-              
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
-              });
+              const int16 = new Int16Array(inputData.length);
+              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              const pcmBlob: Blob = { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' };
+              sessionPromise.then((session) => session.sendRealtimeInput({ media: pcmBlob }));
             };
-
             source.connect(scriptProcessor);
             scriptProcessor.connect(inputAudioContextRef.current!.destination);
           },
@@ -110,34 +104,25 @@ const App: React.FC = () => {
             } else if (message.serverContent?.outputTranscription) {
               currentOutputTranscription.current += message.serverContent.outputTranscription.text;
             }
-
             if (message.serverContent?.turnComplete) {
-              if (currentInputTranscription.current) {
-                setTranscriptions(prev => [...prev, { role: 'user', text: currentInputTranscription.current, timestamp: Date.now() }]);
-              }
-              if (currentOutputTranscription.current) {
-                setTranscriptions(prev => [...prev, { role: 'assistant', text: currentOutputTranscription.current, timestamp: Date.now() }]);
-              }
+              if (currentInputTranscription.current) setTranscriptions(prev => [...prev, { role: 'user', text: currentInputTranscription.current, timestamp: Date.now() }]);
+              if (currentOutputTranscription.current) setTranscriptions(prev => [...prev, { role: 'assistant', text: currentOutputTranscription.current, timestamp: Date.now() }]);
               currentInputTranscription.current = '';
               currentOutputTranscription.current = '';
             }
-
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              
               const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
               const source = ctx.createBufferSource();
               source.buffer = audioBuffer;
               source.connect(ctx.destination);
-              
               source.onended = () => sourcesRef.current.delete(source);
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += audioBuffer.duration;
               sourcesRef.current.add(source);
             }
-
             if (message.serverContent?.interrupted) {
               sourcesRef.current.forEach(s => s.stop());
               sourcesRef.current.clear();
@@ -145,280 +130,305 @@ const App: React.FC = () => {
             }
           },
           onerror: (e) => {
-            console.error('Live API Error:', e);
-            setError('ግንኙነት ተቋርጧል። እባክዎ እንደገና ይሞክሩ።');
+            setError('ግንኙነት ተቋርጧል።');
             disconnect();
           },
-          onclose: () => {
-            disconnect();
-          },
+          onclose: () => disconnect(),
         },
       });
-
       sessionRef.current = await sessionPromise;
-
     } catch (err: any) {
-      console.error(err);
-      setError('ማይክሮፎኑን ማግኘት አልተቻለም። እባክዎ ፍቃድ ይስጡ።');
+      setError('ማይክሮፎኑን ማግኘት አልተቻለም።');
       setIsConnecting(false);
     }
   };
 
   const generateProductImage = async (product: ExtendedProduct) => {
     if (generatingImages[product.name]) return;
-    
     setGeneratingImages(prev => ({ ...prev, [product.name]: true }));
-    setError(null);
-
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [{ text: product.imagePrompt }]
-        },
-        config: {
-          imageConfig: { aspectRatio: "1:1" }
-        }
+        contents: { parts: [{ text: product.imagePrompt }] },
+        config: { imageConfig: { aspectRatio: "1:1" } }
       });
-
       let imageUrl = '';
       for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          imageUrl = `data:image/png;base64,${part.inlineData.data}`;
-          break;
-        }
+        if (part.inlineData) { imageUrl = `data:image/png;base64,${part.inlineData.data}`; break; }
       }
-
-      if (imageUrl) {
-        setProductImages(prev => ({ ...prev, [product.name]: imageUrl }));
-      } else {
-        throw new Error("ምስሉን ማመንጨት አልተቻለም።");
-      }
+      if (imageUrl) setProductImages(prev => ({ ...prev, [product.name]: imageUrl }));
     } catch (err) {
-      console.error("Image Gen Error:", err);
-      setError(`${product.nameAm} ምስል ማመንጨት አልተቻለም። እባክዎ እንደገና ይሞክሩ።`);
+      setError(`${product.nameAm} ምስል ማመንጨት አልተቻለም።`);
     } finally {
       setGeneratingImages(prev => ({ ...prev, [product.name]: false }));
     }
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
-      {/* Header */}
-      <header className="bg-white border-b sticky top-0 z-50 px-6 py-4 flex items-center justify-between shadow-sm">
+    <div className="min-h-screen flex flex-col bg-[#F4F7F6] text-slate-900 selection:bg-yellow-200">
+      {/* Dynamic Header */}
+      <header className="bg-white/80 backdrop-blur-md border-b sticky top-0 z-50 px-4 md:px-8 py-3 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
-          <div className="bg-yellow-500 text-white p-2 rounded-lg">
+          <div className="bg-yellow-500 text-white p-2 rounded-xl shadow-lg shadow-yellow-500/20">
             <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
             </svg>
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">Akeno Assistant</h1>
-            <p className="text-xs text-slate-500 font-medium">የአኬኖ ግንባታ ረዳት</p>
+            <h1 className="text-lg md:text-xl font-black text-slate-800 leading-none">Akeno Assistant</h1>
+            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Industrial Intelligence Hub</p>
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
+          <div className="hidden sm:flex items-center gap-2 mr-4">
+             <button 
+               onClick={() => setShowSetup(!showSetup)}
+               className="flex items-center bg-slate-900 text-white rounded-lg px-3 py-1.5 gap-2 text-[10px] font-black uppercase tracking-widest hover:bg-yellow-500 hover:text-slate-900 transition-all active:scale-95"
+             >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" /></svg>
+                Setup Guide
+             </button>
+          </div>
           <button
             onClick={isConnected ? disconnect : connect}
             disabled={isConnecting}
-            className={`px-6 py-2 rounded-full font-semibold transition-all flex items-center gap-2 ${
-              isConnected 
-              ? 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100' 
-              : 'bg-yellow-500 text-slate-900 hover:bg-yellow-600 shadow-md active:scale-95'
+            className={`px-5 py-2 rounded-xl font-bold transition-all flex items-center gap-2 ${
+              isConnected ? 'bg-red-50 text-red-600 border border-red-200 shadow-inner' : 'bg-yellow-500 text-slate-900 shadow-lg shadow-yellow-500/30 hover:bg-yellow-600 active:scale-95'
             }`}
           >
-            {isConnecting ? (
-              <span className="flex items-center gap-2">
-                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                በመገናኘት ላይ...
-              </span>
-            ) : isConnected ? (
-              <>ያቁሙ (Stop)</>
-            ) : (
-              <>ያናግሩ (Talk)</>
-            )}
+            {isConnecting ? <div className="animate-spin h-4 w-4 border-2 border-slate-900 border-t-transparent rounded-full" /> : isConnected ? 'ያቁሙ' : 'ያናግሩ (Talk)'}
           </button>
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-8 space-y-8">
+      {/* Setup Guide Modal */}
+      {showSetup && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+           <div className="bg-white w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden animate-fade-in">
+              <div className="bg-slate-900 p-6 flex items-center justify-between">
+                 <h2 className="text-white font-black text-lg uppercase tracking-widest">Enterprise Integration Guide</h2>
+                 <button onClick={() => setShowSetup(false)} className="text-slate-400 hover:text-white transition-colors">
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                 </button>
+              </div>
+              <div className="p-8 space-y-6 overflow-y-auto max-h-[70vh]">
+                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                       <h4 className="text-[10px] font-black text-yellow-600 uppercase mb-2">1. LLM Core</h4>
+                       <p className="text-xs font-bold text-slate-700">Google Gemini Flash Engine via Google AI Studio API.</p>
+                    </div>
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                       <h4 className="text-[10px] font-black text-yellow-600 uppercase mb-2">2. Voice Integration</h4>
+                       <p className="text-xs font-bold text-slate-700">Vapi.ai / Retell AI for high-performance TTS & STT.</p>
+                    </div>
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                       <h4 className="text-[10px] font-black text-yellow-600 uppercase mb-2">3. Connectivity</h4>
+                       <p className="text-xs font-bold text-slate-700">Twilio Phone, Telegram Bot API, & WhatsApp Business API.</p>
+                    </div>
+                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
+                       <h4 className="text-[10px] font-black text-yellow-600 uppercase mb-2">4. Automation</h4>
+                       <p className="text-xs font-bold text-slate-700">Make.com / Zapier for CRM and Notification Orchestration.</p>
+                    </div>
+                 </div>
+
+                 <div className="space-y-4 pt-4">
+                    <h3 className="text-sm font-black uppercase text-slate-800 flex items-center gap-2">
+                       <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full" /> Deployment Steps
+                    </h3>
+                    <ol className="space-y-3 text-xs font-medium text-slate-600 list-decimal pl-4">
+                       <li><span className="text-slate-900 font-bold">Clone Repository:</span> Initialize the codebase in your local or cloud environment.</li>
+                       <li><span className="text-slate-900 font-bold">API Configuration:</span> Obtain your Google AI Studio Key and set as <code className="bg-slate-100 px-1 rounded">API_KEY</code>.</li>
+                       <li><span className="text-slate-900 font-bold">System Setup:</span> Apply the provided <code className="bg-slate-100 px-1 rounded">SYSTEM_INSTRUCTION</code> from <code className="bg-slate-100 px-1 rounded">constants.tsx</code>.</li>
+                       <li><span className="text-slate-900 font-bold">Gateway Connection:</span> Hook into Vapi.ai for real-time telephony and voice gateway services.</li>
+                    </ol>
+                 </div>
+              </div>
+              <div className="bg-slate-50 p-6 border-t flex justify-end">
+                 <button onClick={() => setShowSetup(false)} className="bg-slate-900 text-white px-8 py-2 rounded-xl font-bold uppercase text-[10px] tracking-widest shadow-lg shadow-slate-900/20 active:scale-95 transition-all">Understood</button>
+              </div>
+           </div>
+        </div>
+      )}
+
+      <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-6 lg:p-8 space-y-6">
         
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Left: Product Info & Info Cards */}
-          <div className="lg:col-span-1 space-y-6">
-            <section className="bg-white rounded-2xl shadow-sm border p-6">
-              <h2 className="text-lg font-bold mb-4 flex items-center gap-2 text-slate-800">
-                <span className="w-1.5 h-6 bg-yellow-500 rounded-full"></span>
-                የምርት ዋጋ ዝርዝር
-              </h2>
-              <div className="space-y-4">
-                {AKENO_PRODUCTS.map((product, idx) => (
-                  <div key={idx} className="flex justify-between items-center py-2 border-b border-slate-50 last:border-0">
+        {/* Top Info Banner: Smart Logistics */}
+        <div className="bg-gradient-to-r from-slate-900 to-slate-800 rounded-2xl p-4 flex flex-col md:flex-row items-center justify-between gap-4 shadow-xl relative overflow-hidden">
+          <div className="flex items-center gap-4 relative z-10">
+            <div className="bg-yellow-500 text-slate-900 p-3 rounded-full animate-pulse shadow-lg shadow-yellow-500/20">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+            </div>
+            <div>
+              <h2 className="text-white font-black text-lg">Akeno Smart Logistics & Sales</h2>
+              <p className="text-slate-400 text-xs md:text-sm">Handling customer inquiries via Phone, Telegram, and WhatsApp Business.</p>
+            </div>
+          </div>
+          <div className="flex gap-2 relative z-10">
+            <div className="bg-white/10 px-3 py-2 rounded-xl border border-white/10 backdrop-blur-sm">
+               <span className="text-yellow-400 text-[9px] font-black uppercase tracking-widest block mb-0.5 text-center">Voice AI</span>
+               <span className="text-white text-[11px] font-bold">Vapi/Gemini</span>
+            </div>
+            <div className="bg-white/10 px-3 py-2 rounded-xl border border-white/10 backdrop-blur-sm">
+               <span className="text-yellow-400 text-[9px] font-black uppercase tracking-widest block mb-0.5 text-center">Logistics</span>
+               <span className="text-white text-[11px] font-bold">Semera/Afar</span>
+            </div>
+          </div>
+          <div className="absolute -right-10 -bottom-10 text-white/5 rotate-12">
+            <svg className="w-48 h-48" fill="currentColor" viewBox="0 0 24 24"><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm13.5-9l1.96 2.5H17V9.5h2.5zm-1.5 9c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Column 1: Feature List & Pricing */}
+          <div className="lg:col-span-4 space-y-6">
+            <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+               <div className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between">
+                <h3 className="font-bold text-sm uppercase tracking-widest">Enterprise Features</h3>
+                <div className="w-2 h-2 bg-green-500 rounded-full" />
+              </div>
+              <div className="p-4 space-y-3">
+                 <div className="flex items-start gap-3 p-2 hover:bg-slate-50 rounded-lg transition-colors">
+                    <div className="mt-1 text-yellow-600"><svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg></div>
                     <div>
-                      <p className="font-semibold text-slate-800">{product.nameAm}</p>
-                      <p className="text-xs text-slate-400">{product.name}</p>
+                       <p className="text-xs font-black text-slate-800">Multi-Channel Support</p>
+                       <p className="text-[10px] text-slate-500 font-medium leading-tight">Native integration with Phone, Telegram & WhatsApp APIs.</p>
+                    </div>
+                 </div>
+                 <div className="flex items-start gap-3 p-2 hover:bg-slate-50 rounded-lg transition-colors">
+                    <div className="mt-1 text-yellow-600"><svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg></div>
+                    <div>
+                       <p className="text-xs font-black text-slate-800">Logistics Automation</p>
+                       <p className="text-[10px] text-slate-500 font-medium leading-tight">Automated calculation of Free Transport eligibility.</p>
+                    </div>
+                 </div>
+                 <div className="flex items-start gap-3 p-2 hover:bg-slate-50 rounded-lg transition-colors">
+                    <div className="mt-1 text-yellow-600"><svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg></div>
+                    <div>
+                       <p className="text-xs font-black text-slate-800">Fast Payment Flows</p>
+                       <p className="text-[10px] text-slate-500 font-medium leading-tight">Shared banking details & Telebirr for frictionless sales.</p>
+                    </div>
+                 </div>
+              </div>
+            </section>
+
+            <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="bg-slate-50 px-6 py-4 border-b flex items-center justify-between">
+                <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                  <div className="w-1 h-4 bg-yellow-500 rounded-full" /> የዋጋ ዝርዝር (Prices)
+                </h3>
+              </div>
+              <div className="p-2 space-y-1">
+                {AKENO_PRODUCTS.map((p, i) => (
+                  <div key={i} className="group flex justify-between items-center p-3 rounded-xl hover:bg-slate-50 transition-all cursor-default">
+                    <div>
+                      <p className="font-bold text-slate-700 text-sm">{p.nameAm}</p>
+                      <p className="text-[10px] text-slate-400 font-medium uppercase tracking-tighter">{p.name}</p>
                     </div>
                     <div className="text-right">
-                      <p className="text-yellow-600 font-bold">{product.priceAm}</p>
-                      <p className="text-[10px] text-slate-400 uppercase tracking-tighter">{product.price}</p>
+                      <p className="text-slate-900 font-black">{p.priceAm}</p>
                     </div>
                   </div>
                 ))}
               </div>
             </section>
-
-            <section className="bg-slate-800 text-white rounded-2xl shadow-lg p-6 relative overflow-hidden">
-              <div className="relative z-10">
-                <h2 className="text-lg font-bold mb-2">ልዩ ማሳሰቢያ</h2>
-                <p className="text-sm text-slate-300 mb-4 italic">
-                  "ነፃ ትራንስፖርት ከ2000 ብሎኬት በላይ ሲታዘዝ እና እስከ 50 ኪ.ሜ ርቀት ድረስ እንሰጣለን።"
-                </p>
-                <div className="space-y-2 text-xs">
-                  <p><span className="text-yellow-400 font-bold">CBE:</span> 1000368060805</p>
-                  <p><span className="text-yellow-400 font-bold">Telebirr:</span> 0921117148</p>
-                  <p><span className="text-yellow-400 font-bold">አድራሻ:</span> ሰመራ፣ የኢድ ሶላት ሜዳ አጠገብ</p>
-                </div>
-              </div>
-              <div className="absolute -bottom-10 -right-10 opacity-10 text-white">
-                <svg className="w-40 h-40" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
-                </svg>
-              </div>
-            </section>
           </div>
 
-          {/* Right: Conversational UI */}
-          <div className="lg:col-span-2 flex flex-col min-h-[500px]">
-            <div className="bg-white rounded-2xl shadow-sm border flex-1 flex flex-col overflow-hidden relative">
-              
-              {/* Visualizer Overlay */}
-              <div className="bg-slate-50/50 p-4 border-b flex justify-center items-center h-24">
-                <div className="flex flex-col items-center">
-                  <VoiceVisualizer isActive={isConnected} />
-                  <p className={`text-[10px] mt-2 font-bold uppercase tracking-widest ${isConnected ? 'text-green-500 animate-pulse' : 'text-slate-400'}`}>
-                    {isConnected ? 'ላይቭ (Live)' : 'ዝግጁ (Ready)'}
-                  </p>
+          {/* Column 2: Conversational UI */}
+          <div className="lg:col-span-8 flex flex-col h-full min-h-[650px]">
+            <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 flex-1 flex flex-col overflow-hidden relative">
+              <div className="bg-slate-900 p-6 border-b flex justify-center items-center h-32 relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-full">
+                   <div className="absolute inset-0 bg-gradient-to-br from-yellow-500/10 via-transparent to-transparent" />
+                   <div className="absolute bottom-0 right-0 w-64 h-64 bg-yellow-500/5 rounded-full blur-3xl" />
+                </div>
+                <VoiceVisualizer isActive={isConnected} color="#EAB308" />
+                <div className="absolute top-4 left-6 flex items-center gap-2">
+                   <div className="bg-green-500 w-2 h-2 rounded-full animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.8)]" />
+                   <span className="text-[10px] font-black uppercase text-slate-400 tracking-[0.3em]">AI Live Session</span>
                 </div>
               </div>
 
-              {/* Chat History */}
-              <div className="flex-1 overflow-y-auto p-6 space-y-4 max-h-[400px]">
-                {!isConnected && transcriptions.length === 0 && (
-                  <div className="h-full flex flex-col items-center justify-center text-center px-10">
-                    <div className="w-16 h-16 bg-yellow-100 text-yellow-600 rounded-full flex items-center justify-center mb-4">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                      </svg>
+              <div className="flex-1 overflow-y-auto p-4 md:p-10 space-y-8 max-h-[550px]">
+                {transcriptions.length === 0 && (
+                  <div className="h-full flex flex-col items-center justify-center text-center py-12">
+                    <div className="bg-yellow-50 p-10 rounded-full mb-10 relative">
+                       <div className="absolute inset-0 bg-yellow-400 rounded-full animate-ping opacity-10" />
+                       <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 text-yellow-600 relative z-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
                     </div>
-                    <h3 className="text-slate-800 font-bold text-lg mb-2">እንኳን ወደ አኬኖ ኮንስትራክሽን በሰላም መጡ!</h3>
-                    <p className="text-slate-500 text-sm max-w-sm">
-                      የምርት መረጃ ለማግኘት፣ ዋጋ ለመጠየቅ ወይም ትዕዛዝ ለመስጠት "Talk" የሚለውን ቁልፍ በመጫን ያናግሩኝ። በአማርኛ ለመርዳት ዝግጁ ነኝ።
-                    </p>
+                    <h4 className="text-3xl font-black text-slate-800 mb-4 tracking-tighter">Akeno Assistant</h4>
+                    <p className="text-slate-500 max-w-sm mx-auto font-bold text-base leading-relaxed">አማርኛ ተናጋሪ የሽያጭ ረዳት። ስለ ብሎኬት ዋጋ፣ የትራንስፖርት ሁኔታ ወይም ክፍያ ለመጠየቅ "Talk" የሚለውን ተጭነው ያናግሩኝ።</p>
                   </div>
                 )}
 
-                {transcriptions.map((t, idx) => (
-                  <div key={idx} className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[85%] rounded-2xl px-4 py-3 shadow-sm ${
-                      t.role === 'user' 
-                      ? 'bg-yellow-500 text-slate-900 rounded-tr-none' 
-                      : 'bg-slate-100 text-slate-800 rounded-tl-none border'
-                    }`}>
-                      <p className="text-sm font-medium leading-relaxed">{t.text}</p>
-                      <span className="text-[10px] opacity-50 block mt-1 text-right">
-                        {new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </span>
+                {transcriptions.map((t, i) => (
+                  <div key={i} className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+                    <div className={`max-w-[90%] md:max-w-[75%] p-6 rounded-[2rem] shadow-lg ${t.role === 'user' ? 'bg-yellow-500 text-slate-900 rounded-tr-none' : 'bg-slate-50 text-slate-800 rounded-tl-none border border-slate-200'}`}>
+                      <p className="text-sm md:text-lg font-bold leading-tight">{t.text}</p>
+                      <div className="flex items-center justify-between mt-4 opacity-30">
+                         <span className="text-[10px] font-black uppercase tracking-widest">{t.role === 'user' ? 'Customer' : 'Assistant'}</span>
+                         <span className="text-[10px] font-bold">{new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
                     </div>
                   </div>
                 ))}
                 <div ref={transcriptionEndRef} />
               </div>
 
-              {/* Status Footer */}
-              <div className="bg-white p-4 border-t flex items-center justify-between text-[11px] text-slate-400">
-                <div className="flex items-center gap-2">
-                  <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-slate-300'}`}></span>
-                  {isConnected ? 'ግንኙነቱ ንቁ ነው (Connected)' : 'ግንኙነት የለም (Not Connected)'}
-                </div>
-                <div>AI Assistant v1.1 • Multimedia Enhanced</div>
+              {error && <div className="mx-8 mb-6 p-4 bg-red-600 text-white text-[11px] font-black rounded-2xl text-center shadow-2xl animate-bounce">{error}</div>}
+              
+              <div className="p-5 border-t bg-slate-50 flex items-center justify-between">
+                 <div className="flex gap-6">
+                    <button className="text-[11px] font-black uppercase text-slate-400 hover:text-slate-900 transition-all border-b border-transparent hover:border-slate-900">Transcription</button>
+                    <button className="text-[11px] font-black uppercase text-slate-400 hover:text-slate-900 transition-all border-b border-transparent hover:border-slate-900">Manager Connect</button>
+                 </div>
+                 <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Channel:</span>
+                    <span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[9px] font-black uppercase">Web Voice</span>
+                 </div>
               </div>
-
-              {error && (
-                <div className="absolute bottom-20 left-1/2 -translate-x-1/2 w-[90%] bg-red-500 text-white px-4 py-2 rounded-lg text-xs font-bold text-center animate-bounce shadow-lg z-20">
-                  {error}
-                </div>
-              )}
             </div>
           </div>
         </div>
 
-        {/* Product Visuals Gallery Section */}
-        <section className="bg-white rounded-3xl shadow-sm border p-8">
-          <div className="flex items-center justify-between mb-8">
-            <h2 className="text-2xl font-black text-slate-800 flex items-center gap-3">
-              <span className="w-2 h-8 bg-yellow-500 rounded-full"></span>
-              የምርት ምስሎች (Product Visuals)
-            </h2>
-            <p className="text-sm text-slate-400 font-medium">በ AI የተፈጠሩ የምርት ቅድመ-እይታዎች</p>
+        {/* Product Visuals Grid */}
+        <section className="space-y-8 pt-12">
+          <div className="flex items-center gap-6 px-2">
+             <h3 className="text-3xl font-black text-slate-800 shrink-0">Product Visuals</h3>
+             <div className="h-1 flex-1 bg-slate-200 rounded-full" />
+             <p className="text-[11px] font-black text-slate-400 uppercase tracking-widest">AI Generated Previews</p>
           </div>
-          
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {AKENO_PRODUCTS.map((product) => (
-              <div key={product.name} className="group bg-slate-50 rounded-2xl border border-slate-100 overflow-hidden transition-all hover:shadow-md hover:-translate-y-1">
-                <div className="aspect-square bg-slate-200 relative overflow-hidden">
-                  {productImages[product.name] ? (
-                    <img 
-                      src={productImages[product.name]} 
-                      alt={product.nameAm} 
-                      className="w-full h-full object-cover animate-fade-in"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center p-6 text-center">
-                      {generatingImages[product.name] ? (
-                        <div className="flex flex-col items-center gap-3">
-                          <svg className="animate-spin h-8 w-8 text-yellow-500" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                          </svg>
-                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">በመፍጠር ላይ...</p>
-                        </div>
-                      ) : (
-                        <div className="text-slate-400 opacity-60">
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                          </svg>
-                          <p className="text-xs font-semibold">ምስል የለም</p>
-                        </div>
-                      )}
-                    </div>
-                  )}
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-6">
+            {AKENO_PRODUCTS.map((p) => (
+              <div key={p.name} className="bg-white rounded-3xl border border-slate-100 p-4 group transition-all hover:shadow-2xl hover:-translate-y-2">
+                <div className="aspect-square bg-slate-50 rounded-2xl overflow-hidden mb-4 relative shadow-inner">
+                   {productImages[p.name] ? (
+                     <img src={productImages[p.name]} alt={p.nameAm} className="w-full h-full object-cover animate-fade-in" />
+                   ) : (
+                     <div className="w-full h-full flex flex-col items-center justify-center p-4">
+                        {generatingImages[p.name] ? (
+                           <div className="flex flex-col items-center gap-2">
+                             <div className="w-6 h-6 border-2 border-yellow-500 border-t-transparent rounded-full animate-spin" />
+                             <span className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Processing</span>
+                           </div>
+                        ) : (
+                          <div className="bg-slate-200/40 p-5 rounded-full group-hover:bg-yellow-100 transition-all group-hover:scale-110">
+                            <svg className="w-8 h-8 text-slate-300 group-hover:text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                          </div>
+                        )}
+                     </div>
+                   )}
                 </div>
-                
-                <div className="p-4 flex flex-col gap-3">
-                  <div>
-                    <h3 className="font-bold text-slate-800 text-sm leading-tight">{product.nameAm}</h3>
-                    <p className="text-[10px] text-slate-400 mt-1 uppercase tracking-tight">{product.name}</p>
-                  </div>
-                  
+                <div className="space-y-3">
+                  <h4 className="text-[12px] font-black text-slate-800 text-center">{p.nameAm}</h4>
                   <button 
-                    onClick={() => generateProductImage(product)}
-                    disabled={generatingImages[product.name]}
-                    className={`w-full py-2 rounded-xl text-[11px] font-bold transition-all flex items-center justify-center gap-2 ${
-                      productImages[product.name] 
-                      ? 'bg-slate-100 text-slate-500 hover:bg-slate-200' 
-                      : 'bg-yellow-500 text-slate-900 hover:bg-yellow-600 shadow-sm active:scale-95'
-                    }`}
+                    onClick={() => generateProductImage(p)}
+                    disabled={generatingImages[p.name]}
+                    className={`w-full py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${productImages[p.name] ? 'bg-slate-100 text-slate-400' : 'bg-slate-900 text-white hover:bg-yellow-500 hover:text-slate-900 shadow-xl active:scale-95'}`}
                   >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-                    </svg>
-                    {generatingImages[product.name] ? 'በመፍጠር ላይ...' : productImages[product.name] ? 'እንደገና ፍጠር' : 'ምስል ፍጠር'}
+                    {generatingImages[p.name] ? 'Building...' : productImages[p.name] ? 'Regenerate' : 'Generate Visual'}
                   </button>
                 </div>
               </div>
@@ -427,27 +437,74 @@ const App: React.FC = () => {
         </section>
       </main>
 
-      <footer className="mt-auto border-t py-6 px-4 bg-white">
-        <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4 text-slate-500 text-xs">
-          <p>© {new Date().getFullYear()} አኬኖ ኮንስትራክሽን እና ተያያዥ ግብዓቶች ማምረቻ:: ሰመራ::</p>
-          <div className="flex gap-4">
-            <a href="#" className="hover:text-yellow-600 underline decoration-yellow-200">የአገልግሎት ውል</a>
-            <a href="#" className="hover:text-yellow-600 underline decoration-yellow-200">የግላዊነት ፖሊሲ</a>
+      <footer className="bg-slate-900 text-white mt-16 py-20 px-8 relative overflow-hidden">
+        <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-12 gap-16 relative z-10">
+          <div className="md:col-span-6 space-y-8">
+            <div className="flex items-center gap-4">
+               <div className="bg-yellow-500 text-slate-900 w-12 h-12 rounded-2xl flex items-center justify-center font-black text-2xl shadow-lg shadow-yellow-500/20">AK</div>
+               <div>
+                  <h5 className="font-black text-2xl uppercase tracking-[0.2em]">Akeno Construction</h5>
+                  <p className="text-[10px] text-yellow-500 font-black uppercase tracking-widest mt-1">Manufacturing Industrial Solutions</p>
+               </div>
+            </div>
+            <p className="text-slate-400 text-base max-w-lg font-medium leading-relaxed">
+              Leading the Afar region in reinforced concrete production and high-quality construction inputs. Integrated with AI for seamless customer excellence.
+            </p>
+            <div className="flex gap-6">
+               <div className="bg-white/5 border border-white/10 p-4 rounded-2xl flex items-center gap-4 pr-10 hover:bg-white/10 transition-colors">
+                  <div className="bg-green-500 w-3 h-3 rounded-full shadow-[0_0_12px_rgba(34,197,94,0.6)]" />
+                  <div>
+                    <span className="block text-[11px] font-black text-slate-500 uppercase tracking-widest">Voice Gateway</span>
+                    <span className="text-sm font-bold">Vapi.ai Connected</span>
+                  </div>
+               </div>
+               <div className="bg-white/5 border border-white/10 p-4 rounded-2xl flex items-center gap-4 pr-10 hover:bg-white/10 transition-colors">
+                  <div className="bg-blue-500 w-3 h-3 rounded-full shadow-[0_0_12px_rgba(59,130,246,0.6)]" />
+                  <div>
+                    <span className="block text-[11px] font-black text-slate-500 uppercase tracking-widest">Automation</span>
+                    <span className="text-sm font-bold">Make.com Sync</span>
+                  </div>
+               </div>
+            </div>
+          </div>
+          
+          <div className="md:col-span-3 space-y-6">
+             <h6 className="text-xs font-black uppercase tracking-[0.3em] text-yellow-500">Contact Hub</h6>
+             <div className="space-y-4 text-sm text-slate-300 font-medium">
+                <p className="flex items-center gap-4 hover:text-white transition-colors cursor-pointer group">
+                  <svg className="w-5 h-5 text-slate-500 group-hover:text-yellow-500 transition-colors" fill="currentColor" viewBox="0 0 24 24"><path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></svg> 
+                  0921117148
+                </p>
+                <p className="flex items-start gap-4 hover:text-white transition-colors cursor-pointer group leading-snug">
+                  <svg className="w-5 h-5 text-slate-500 group-hover:text-yellow-500 transition-colors shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg> 
+                  Semera, Afar Region,<br/>Ethiopia (Near Eid Meda)
+                </p>
+             </div>
+          </div>
+
+          <div className="md:col-span-3 space-y-6">
+             <h6 className="text-xs font-black uppercase tracking-[0.3em] text-yellow-500">Enterprise Stack</h6>
+             <div className="flex flex-col gap-3">
+                <div className="bg-white/5 border border-white/10 px-4 py-3 rounded-2xl text-[11px] font-bold text-slate-400 flex items-center justify-between">
+                   <span>Twilio / Telephony</span>
+                   <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full" />
+                </div>
+                <div className="bg-white/5 border border-white/10 px-4 py-3 rounded-2xl text-[11px] font-bold text-slate-400 flex items-center justify-between">
+                   <span>Telegram / WhatsApp</span>
+                   <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full" />
+                </div>
+                <div className="bg-white/5 border border-white/10 px-4 py-3 rounded-2xl text-[11px] font-bold text-slate-400 flex items-center justify-between">
+                   <span>CRM / Make.com</span>
+                   <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full" />
+                </div>
+             </div>
           </div>
         </div>
-      </footer>
-
-      <style>{`
-        @keyframes fadeIn {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-        .animate-fade-in {
-          animation: fadeIn 0.5s ease-out forwards;
-        }
-      `}</style>
-    </div>
-  );
-};
-
-export default App;
+        
+        <div className="mt-20 pt-8 border-t border-white/5 flex flex-col md:flex-row items-center justify-between gap-6">
+           <p className="text-[11px] text-slate-500 font-bold uppercase tracking-widest">
+              © {new Date().getFullYear()} Akeno Construction Assistant v1.8 Pro • Enterprise Edition
+           </p>
+           <div className="flex gap-8 text-[11px] font-black uppercase tracking-widest text-slate-500">
+              <a href="#" className="hover:text-yellow-500 transition-colors">Privacy</a>
+              <a href="#" className="hover
