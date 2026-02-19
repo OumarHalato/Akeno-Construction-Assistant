@@ -8,7 +8,8 @@ interface VoiceVisualizerProps {
 
 const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({ isActive, color = '#EAB308' }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const requestRef = useRef<number>();
+  // Fix: Provide initial value for useRef to satisfy strict TypeScript requirements
+  const requestRef = useRef<number>(0);
 
   useEffect(() => {
     const canvas = canvasRef.current;
